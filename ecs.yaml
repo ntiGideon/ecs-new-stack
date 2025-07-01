@@ -1,0 +1,394 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Cluster and Service for Image Application'
+
+Parameters:
+  EnvironmentName:
+    Description: 'An environment name that is prefixed to resource names'
+    Type: String
+    Default: 'ImageApp'
+  
+  ECRRepositoryName:
+    Description: 'Name of the ECR repository'
+    Type: String
+    Default: 'springboot-image-app'
+  
+  ImageTag:
+    Description: 'Tag of the Docker image to deploy'
+    Type: String
+    Default: 'latest'
+  
+  DesiredCount:
+    Description: 'Number of tasks to run'
+    Type: Number
+    Default: 2
+  
+  ContainerPort:
+    Description: 'Port that the container listens on'
+    Type: Number
+    Default: 8000
+  
+  HostPort:
+    Description: 'Port that the host listens on'
+    Type: Number
+    Default: 8000
+  
+  ContainerMemory:
+    Description: 'Memory to allocate to the container (MB)'
+    Type: Number
+    Default: 512
+  
+  ContainerCPU:
+    Description: 'CPU units to allocate to the container (1 vCPU = 1024)'
+    Type: Number
+    Default: 256
+
+  DatabaseUrl:
+    Description: 'RDS endpoint URL'
+    Type: String
+  DatabaseUsername:
+    Description: 'Database username'
+    Type: String
+  DatabasePassword:
+    Description: 'Database password'
+    Type: String
+    NoEcho: true  
+
+  AwsBucketName:
+    Description: 'Aws Bucket Name'
+    Type: String
+  AwsAccessKey:
+    Description: 'Aws Access Key'
+    Type: String    
+  AwsSecretKey:
+    Description: 'Aws Secret Key'
+    Type: String 
+  AppPort:
+    Description: 'App Port'
+    Type: String       
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${EnvironmentName}-Cluster
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+          Base: 1
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${EnvironmentName}-ALB
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !ImportValue ImageApp-ALBSecurityGroupId
+      Subnets:
+        - !ImportValue ImageApp-PublicSubnet1Id
+        - !ImportValue ImageApp-PublicSubnet2Id
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: ALB
+    Properties:
+      Name: !Sub ${EnvironmentName}-TG
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !ImportValue ImageApp-VPCId
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 60
+      HealthCheckTimeoutSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: '200-499'
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn: 
+      - ALB
+      - ALBTargetGroup
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: !Sub ${EnvironmentName}-ECSTaskExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: '*'
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${EnvironmentName}-Task
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      Cpu: !Ref ContainerCPU
+      Memory: !Ref ContainerMemory
+      ContainerDefinitions:
+        - Name: !Sub ${EnvironmentName}-Container
+          Image: 767828749690.dkr.ecr.eu-central-1.amazonaws.com/springboot-image-app:latest
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              HostPort: !Ref HostPort
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogsGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: production
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name:  DATABASE_URL
+              Value: !Ref DatabaseUrl 
+            - Name:  DATABASE_USERNAME
+              Value: !Ref DatabaseUsername
+            - Name:  DATABASE_PASSWORD
+              Value: !Ref DatabasePassword 
+            - Name:  AWS_BUCKET_NAME
+              Value: !Ref AwsBucketName 
+            - Name:  AWS_ACCESS_KEY
+              Value: !Ref AwsAccessKey
+            - Name:   AWS_SECRET_KEY
+              Value: !Ref AwsSecretKey
+
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${EnvironmentName}-Task
+      RetentionInDays: 7
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+      - ALBTargetGroup
+      - ECSTaskDefinition
+    Properties:
+      ServiceName: !Sub ${EnvironmentName}-Service
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      HealthCheckGracePeriodSeconds: 120
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !ImportValue ImageApp-ECSSecurityGroupId
+          Subnets:
+            - !ImportValue ImageApp-PrivateSubnet1Id
+            - !ImportValue ImageApp-PrivateSubnet2Id
+      LoadBalancers:
+        - ContainerName: !Sub ${EnvironmentName}-Container
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref ALBTargetGroup
+      TaskDefinition: !Ref ECSTaskDefinition
+
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: service-autoscaling
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - application-autoscaling:*
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:PutMetricAlarm
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                Resource: '*'
+
+  ECSServiceAutoScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: ECSService
+    Properties:
+      MaxCapacity: 4
+      MinCapacity: 2
+      ResourceId: !Sub "service/${ECSCluster}/${ECSService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !GetAtt AutoScalingRole.Arn
+
+  ECSServiceScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    DependsOn: ECSServiceAutoScaling
+    Properties:
+      PolicyName: !Sub ${EnvironmentName}-ScaleOutPolicy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ECSServiceAutoScaling
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 50.0
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+  CPUUtilizationAlarmHigh:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: ECSServiceAutoScaling
+    Properties:
+      AlarmDescription: 'Alarm if CPU too high or metric disappears indicating instance is down'
+      Namespace: 'AWS/ECS'
+      MetricName: 'CPUUtilization'
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref ECSServiceScalingPolicy
+  
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ComputePlatform: ECS
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      BlueGreenDeploymentConfiguration:
+        TerminationWaitTimeInMinutes: 5
+        DeploymentReadyOption:
+          WaitTimeInMinutes: 5
+      EcsServices:
+        - ClusterName: !Ref ECSCluster
+          ServiceName: !GetAtt ECSService.Name
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - TargetGroups:
+              - Name: !GetAtt ALBTargetGroup.TargetGroupName
+                Weight: 100
+              - Name: !GetAtt ALBGreenTargetGroup.TargetGroupName
+                Weight: 0
+            ProdTrafficRoute:
+              ListenerArns:
+                - !Ref ALBListener
+            TestTrafficRoute:
+              ListenerArns:
+                - !Ref ALBTestListener
+
+  ALBGreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-GreenTG
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !ImportValue ImageApp-VPCId
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200-499'
+
+  ALBTestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBGreenTargetGroup
+      LoadBalancerArn: !Ref ALB
+      Port: 9000  # Test listener port
+      Protocol: HTTP
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: CodeDeployPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:*
+                  - elasticloadbalancing:*
+                  - cloudwatch:*
+                  - sns:*
+                  - iam:PassRole
+                Resource: '*'
+
+
+Outputs:
+  ALBDNSName:
+    Description: 'DNS name of the ALB'
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub ${EnvironmentName}-ALBDNSName
+
+  ECSClusterName:
+    Description: 'Name of the ECS Cluster'
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${EnvironmentName}-ECSClusterName
+
